@@ -34,10 +34,17 @@ class CaseRetrieval:
         return True
 
     # ===================== 推理检索 =====================
-    def retrieve_top_k(self, text, aspect, top_k=2):
+    def retrieve_top_k(self, text, aspect, top_k=1, threshold=0.6):
         query = f"{text} [SEP] {aspect}"
         query_embed = self.embedder.encode(query, convert_to_tensor=True)
+
+        corpus_embeds = self.corpus_embeds.to(query_embed.device)
+        scores = util.cos_sim(query_embed, corpus_embeds)[0]
+        candidates = [(i, s.item()) for i, s in enumerate(scores) if threshold < s.item() < 0.95]
+
+        if not candidates:
+            return [] 
         
-        scores = util.cos_sim(query_embed, self.corpus_embeds)[0]
-        top_indices = torch.topk(scores, k=top_k).indices.cpu().numpy()
+        candidates = sorted(candidates, key=lambda x: x[1], reverse=True)
+        top_indices = [i for i, _ in candidates[:top_k]]
         return [self.cases[i] for i in top_indices]

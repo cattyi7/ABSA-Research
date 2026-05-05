@@ -60,7 +60,7 @@ class RobertaAspectModel(nn.Module):
         nn.init.normal_(self.classifier.weight, std=0.02)
         nn.init.zeros_(self.classifier.bias)
 
-    def forward(self, input_ids, attention_mask=None, output_attn_weight=False):
+    def forward(self, input_ids, attention_mask=None, rationale_mask=None, output_attn_weight=False):
         outputs = self.roberta(
             input_ids=input_ids,
             attention_mask=attention_mask
@@ -83,9 +83,14 @@ class RobertaAspectModel(nn.Module):
         attended_output = self.dropout(attended_output)
         logits = self.classifier(attended_output)
 
+        attn_loss = torch.tensor(0.0, device=input_ids.device)
+
+        if rationale_mask is not None:
+            attn_loss = self.compute_attention_loss(attn_weights, rationale_mask)
+            
         if output_attn_weight:
-            return logits, attn_weights   
-        return logits
+            return logits, attn_weights, attn_loss
+        return logits, attn_loss
 
     def predict(
         self,
@@ -94,7 +99,7 @@ class RobertaAspectModel(nn.Module):
     ) -> torch.Tensor:
         """预测概率"""
         with torch.no_grad(): #不用算梯度，节省时间
-            logits = self.forward(input_ids, attention_mask)
+            logits, _ = self.forward(input_ids, attention_mask)
             probabilities = torch.softmax(logits, dim=1)
         return probabilities
 
@@ -120,6 +125,16 @@ class RobertaAspectModel(nn.Module):
 
         return cls(model_config)
 
+    def compute_attention_loss(self, attn_weights, rationale_mask):
+        # 把 rationale mask 归一化成概率分布
+        rational_sum = rationale_mask.sum(dim=-1, keepdim=True) + 1e-8
+        rational_dist = rationale_mask / rational_sum
+
+        # 让模型的 attention 分布 去匹配 关键词分布
+        attn_log = torch.log(attn_weights + 1e-8)
+        attn_loss = -torch.sum(rational_dist * attn_log, dim=-1).mean()
+
+        return attn_loss
 
 class RobertaAspectTokenizerWrapper:
     """

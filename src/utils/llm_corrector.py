@@ -1,6 +1,7 @@
 import requests
 import json
 import os
+import time
 
 class DeepSeekCorrector:
     def __init__(self, api_token):
@@ -16,24 +17,28 @@ class DeepSeekCorrector:
     # --------------------------
     # 统一的API调用接口
     # --------------------------
-    def _call_api(self, prompt, temperature=0.1):
+    def _call_api(self, prompt, temperature=0.1, max_retries=3):
         data = {
             "model": "deepseek-chat",
             "messages": [{"role": "user", "content": prompt.strip()}],
             "temperature": temperature
         }
-        try:
-            rsp = requests.post(
-                self.url,
-                headers=self.headers,
-                json=data,
-                timeout=15
-            )
-            rsp.raise_for_status()
-            return rsp.json()["choices"][0]["message"]["content"].strip()
-        except Exception as e:
-            print("LLM API Error:", e)
-            return ""
+        for attempt in range(max_retries):
+            try:
+                rsp = requests.post(
+                    self.url,
+                    headers=self.headers,
+                    json=data,
+                    timeout=15
+                )
+                rsp.raise_for_status()
+                return rsp.json()["choices"][0]["message"]["content"].strip()
+            except Exception as e:
+                print(f"LLM API Error attempt {attempt+1}: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                else:
+                    return ""
 
     # --------------------------
     # 标签清洗

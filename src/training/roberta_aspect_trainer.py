@@ -20,14 +20,42 @@ from ..architectures.roberta_aspect import RobertaAspectModel, RobertaAspectToke
 from ..utils.config import Config
 from src.losses.focal_loss import FocalLoss
 
+class FGM:
+    """Fast Gradient Method for adversarial training on embeddings."""
+    def __init__(self, model):
+        self.model = model
+        self.backup = {}
+
+    def attack(self, epsilon=0.5):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and 'embeddings' in name:
+                self.backup[name] = param.data.clone()
+                norm = torch.norm(param.grad)
+                if norm != 0:
+                    r_at = epsilon * param.grad / norm
+                    param.data.add_(r_at)
+
+    def restore(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and 'embeddings' in name:
+                assert name in self.backup
+                param.data = self.backup[name]
+        self.backup = {}
+
+
+
 class RobertaAspectTrainer:
-    def __init__(self, language="english", num_classes=2, lr=8e-6, patience=4):
+    def __init__(self, language="english", num_classes=2, lr=1.2e-5, patience=4, use_rationale=False,rationale_lambda=0.5,use_gfm=False):
         self.language = language
         self.lr = lr
         self.patience = patience
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda")
         self.model_type = "roberta_aspect"
         self.num_classes = num_classes
+        self.use_rationale = use_rationale
+        self.rationale_lambda = rationale_lambda  # rationale attention loss 的权重
+        self.use_fgm = use_gfm  # 是否使用 FGM 对抗训练
+
 
         # 模型 & 分词器
         self.model = RobertaAspectModel.create_model(language=language).to(self.device)
@@ -54,41 +82,80 @@ class RobertaAspectTrainer:
         all_preds = []
         all_labels = []
 
-        USE_RATIONALE_ATTN = False  # 是否使用 rationale attention
+        CONFIDENCE_THRESHOLD = 0.85  # rationale attention 的置信度阈值
 
         for batch in tqdm(train_loader, desc="训练中"):
             input_ids = batch["input_ids"].to(self.device)
             attention_mask = batch["attention_mask"].to(self.device)
             labels = batch["labels"].to(self.device)
-
             rationale_mask = batch["rationale_mask"].to(self.device)
 
             optimizer.zero_grad()
-            logits, attn_weights = self.model(
-                input_ids, 
-                attention_mask, 
-                output_attn_weight=True  # 打开开关
+
+            if not self.use_rationale:
+                rationale_mask = None
+
+            logits, attn_loss = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                rationale_mask=rationale_mask
             )
-            # 1. 原始分类损失
+
             cls_loss = self.criterion(logits, labels)
 
-            # 2. 【核心新增】Rationale 注意力监督损失
-            attn_loss = 0.0
-            if USE_RATIONALE_ATTN:
-                # 直接监督 AspectAttention！
-                attn_loss = -torch.mean(attn_weights * rationale_mask)
+            # ===================== 只有全局开关打开时，才考虑门控 =====================
+            
+            if self.use_rationale:
+                probs = torch.softmax(logits, dim=-1)
+                max_conf = torch.max(probs, dim=-1)[0]
 
-                # 3. 总损失（0.1 是稳定系数）
-            total_loss_batch = cls_loss + 0.1 * attn_loss
+                #置信度权重
+                conf_weight = (1.0 - max_conf).detach()  # 置信度越低，权重越大
+
+                #有效rationale
+                valid_mask = (rationale_mask.sum(dim=1) > 0).float()  # [B]
+
+                #最终权重
+                rationale_weight = conf_weight * valid_mask  # [B]
+
+                weighted_attn_loss = attn_loss * rationale_weight.mean()  # 按照权重调整 attention loss
+
+                loss = cls_loss + self.rationale_lambda * weighted_attn_loss  # 总损失 = 分类损失 + 加权的 attention 损失
+            else:
+                loss = cls_loss
 
             # 反向传播（用总损失）
-            total_loss_batch.backward()
+            loss.backward()
+
+            if self.use_fgm:   # 设置一个开关
+                if not hasattr(self, 'fgm'):          
+                    self.fgm = FGM(self.model)        
+                self.fgm.attack(epsilon=0.5)   # 在embedding上加扰动
+                # 对抗扰动下再前向一次，计算对抗loss
+                logits_adv, attn_loss_adv = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    rationale_mask=rationale_mask
+                )
+                cls_loss_adv = self.criterion(logits_adv, labels)
+                if self.use_rationale:
+                    probs_adv = torch.softmax(logits_adv, dim=-1)
+                    max_conf_adv = torch.max(probs_adv, dim=-1)[0]
+                    conf_weight_adv = (1.0 - max_conf_adv).detach()
+                    valid_mask_adv = (rationale_mask.sum(dim=1) > 0).float()
+                    rationale_weight_adv = conf_weight_adv * valid_mask_adv
+                    weighted_attn_loss_adv = attn_loss_adv * rationale_weight_adv.mean()
+                    loss_adv = cls_loss_adv + self.rationale_lambda * weighted_attn_loss_adv
+                else:
+                    loss_adv = cls_loss_adv
+                loss_adv.backward()   # 累积梯度
+                self.fgm.restore()     # 恢复原始embedding
 
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0) #梯度裁剪
             optimizer.step() #优化器更新权重
             scheduler.step() #学习率调度器更新学习率
 
-            total_loss += total_loss_batch.item()
+            total_loss += loss.item()
             preds = torch.argmax(logits, dim=1)
             all_preds.extend(preds.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
@@ -109,7 +176,7 @@ class RobertaAspectTrainer:
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
 
-                logits = self.model(input_ids, attention_mask)
+                logits,_ = self.model(input_ids, attention_mask)
                 loss = self.criterion(logits, labels)
                 total_loss += loss.item()
 
@@ -121,15 +188,15 @@ class RobertaAspectTrainer:
         acc = accuracy_score(all_labels, all_preds)
         return avg_loss, acc
 
-    def train(self, train_loader, val_loader, epochs=8, lr=8e-6, save_best=True):
-        print(f"\n🚀 开始训练 Aspect-RoBERTa，共 {epochs} 轮 | 学习率: {lr}")
+    def train(self, train_loader, val_loader, epochs=8, save_best=True):
+        print(f"\n🚀 开始训练 Aspect-RoBERTa，共 {epochs} 轮 | 学习率: {self.lr}")
 
         # 优化器
         no_decay = ["bias", "LayerNorm.weight","lora"] # 不进行权重衰减的参数
         optimizer_grouped_parameters = [
             {
                 "params": [p for n, p in self.model.named_parameters() if not any(nd in n for nd in no_decay)],
-                "weight_decay": 0.01,
+                "weight_decay": 0.05,
             },
             {
                 "params": [p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay)],
@@ -213,7 +280,7 @@ class RobertaAspectTrainer:
                 input_ids = batch["input_ids"].to(self.device)
                 attention_mask = batch["attention_mask"].to(self.device)
                 labels = batch["labels"].to(self.device)
-                logits = self.model(input_ids, attention_mask)
+                logits, _ = self.model(input_ids, attention_mask)
                 preds = torch.argmax(logits, dim=1)
                 all_preds.extend(preds.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
